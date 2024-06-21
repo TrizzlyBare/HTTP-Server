@@ -1,118 +1,125 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 )
 
-const CRLF = "\r\n"
-
 func main() {
-	// Print logs for debugging
 	fmt.Println("Logs from your program will appear here!")
-
-	// Use flag to parse the directory argument
-	dir := flag.String("directory", "", "enter a directory")
-	flag.Parse()
-
-	// Bind to port 4221
-	ln, err := net.Listen("tcp", "0.0.0.0:4221")
+	l, err := net.Listen("tcp", "0.0.0.0:4221")
 	if err != nil {
-		fmt.Println("Failed to bind to port 4221", err)
+		fmt.Println("Failed to bind to port 4221:", err)
 		os.Exit(1)
 	}
-	defer ln.Close()
+	defer l.Close()
 
-	fmt.Println("Server is listening on port 4221")
+	fmt.Println("Server is now listening on port 4221...")
 
-	// Accept connections in a loop
 	for {
-		conn, err := ln.Accept()
+		conn, err := l.Accept()
 		if err != nil {
 			fmt.Println("Error accepting connection:", err)
 			continue
 		}
-
-		// Handle each connection in a separate goroutine
-		go func() {
-			defer conn.Close()
-
-			// Read the request
-			buf := make([]byte, 1024)
-			_, err = conn.Read(buf)
-			if err != nil {
-				fmt.Println("Error reading request:", err)
-				return
-			}
-
-			req := string(buf)
-			lines := strings.Split(req, CRLF)
-			if len(lines) < 1 {
-				fmt.Println("Invalid request")
-				return
-			}
-
-			// Parse the request line
-			requestLine := strings.Split(lines[0], " ")
-			if len(requestLine) < 2 {
-				fmt.Println("Invalid request line")
-				return
-			}
-
-			method := requestLine[0]
-			path := requestLine[1]
-
-			fmt.Println("Request path:", path)
-
-			var res string
-
-			switch {
-			case path == "/":
-				res = "HTTP/1.1 200 OK\r\n\r\n/"
-			case strings.HasPrefix(path, "/echo/"):
-				msg := strings.TrimPrefix(path, "/echo/")
-				res = fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %v\r\n\r\n%v", len(msg), msg)
-			case path == "/user-agent":
-				if len(lines) > 2 {
-					msg := strings.Split(lines[2], " ")[1]
-					res = fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %v\r\n\r\n%v", len(msg), msg)
-				} else {
-					res = "HTTP/1.1 404 Not Found\r\n\r\n"
-				}
-			case strings.HasPrefix(path, "/files/") && *dir != "":
-				filename := strings.TrimPrefix(path, "/files/")
-				filepath := *dir + filename
-				fmt.Println("Filepath:", filepath)
-
-				if method == "GET" {
-					if file, err := os.ReadFile(filepath); err == nil {
-						content := string(file)
-						res = fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n%s", len(content), content)
-					} else {
-						res = "HTTP/1.1 404 Not Found\r\n\r\n"
-					}
-				} else if method == "POST" {
-					body := strings.Split(req, CRLF+CRLF)[1]
-					if err := os.WriteFile(filepath, []byte(body), 0644); err == nil {
-						fmt.Println("Wrote file")
-						res = "HTTP/1.1 201 Created\r\n\r\n"
-					} else {
-						res = "HTTP/1.1 500 Internal Server Error\r\n\r\n"
-					}
-				}
-			default:
-				res = "HTTP/1.1 404 Not Found\r\n\r\n"
-			}
-
-			// Send the response
-			_, err = conn.Write([]byte(res))
-			if err != nil {
-				fmt.Println("Error writing response:", err)
-				return
-			}
-		}()
+		go handleConn(conn)
 	}
+}
+
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	req := make([]byte, 1024)
+	n, err := conn.Read(req)
+	if err != nil {
+		fmt.Println("Error reading request:", err)
+		return
+	}
+	request := string(req[:n])
+
+	switch {
+	case isGetRootRequest(request):
+		writeResponse(conn, "HTTP/1.1 200 OK\r\n\r\n")
+	case isGetEchoRequest(request):
+		path := extractEchoPath(request)
+		writeResponse(conn, fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(path), path))
+	case isGetUserAgentRequest(request):
+		userAgent := extractUserAgent(request)
+		writeResponse(conn, fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(userAgent), userAgent))
+	case isGetFileRequest(request):
+		dir := os.Args[2]
+		path := extractFilePath(request)
+		data, err := os.ReadFile(dir + path)
+		if err != nil {
+			writeResponse(conn, "HTTP/1.1 404 Not Found\r\n\r\n")
+		} else {
+			writeResponse(conn, fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n%s", len(data), data))
+		}
+	case isPostFileRequest(request):
+		dir := os.Args[2]
+		path := extractFilePath(request)
+		body := extractPostBody(request)
+		err := os.WriteFile(dir+path, []byte(body), 0666)
+		if err != nil {
+			writeResponse(conn, "HTTP/1.1 404 Not Found\r\n\r\n")
+		} else {
+			writeResponse(conn, "HTTP/1.1 201 Created\r\n\r\n")
+		}
+	default:
+		writeResponse(conn, "HTTP/1.1 404 Not Found\r\n\r\n")
+	}
+}
+
+func isGetRootRequest(request string) bool {
+	match, _ := regexp.MatchString("GET / HTTP/1.1", request)
+	return match
+}
+
+func isGetEchoRequest(request string) bool {
+	match, _ := regexp.MatchString("^GET /echo/[A-Za-z0-9\\-._~%]+ HTTP/1\\.1", request)
+	return match
+}
+
+func isGetUserAgentRequest(request string) bool {
+	match, _ := regexp.MatchString("^GET /user-agent HTTP/1\\.1", request)
+	return match
+}
+
+func isGetFileRequest(request string) bool {
+	match, _ := regexp.MatchString("^GET /files/[A-Za-z0-9\\-._~%]+ HTTP/1\\.1", request)
+	return match
+}
+
+func isPostFileRequest(request string) bool {
+	match, _ := regexp.MatchString("^POST /files/[A-Za-z0-9\\-._~%]+ HTTP/1\\.1", request)
+	return match
+}
+
+func extractEchoPath(request string) string {
+	path := regexp.MustCompile("^GET /echo/([A-Za-z0-9\\-._~%]+) HTTP/1\\.1").FindStringSubmatch(request)[1]
+	return path
+}
+
+func extractUserAgent(request string) string {
+	userAgent := regexp.MustCompile("User-Agent: (.*)").FindStringSubmatch(request)[1]
+	userAgent = strings.Trim(userAgent, "\r\n")
+	return userAgent
+}
+
+func extractFilePath(request string) string {
+	path := regexp.MustCompile("^(GET|POST) /files/([A-Za-z0-9\\-._~%]+) HTTP/1\\.1").FindStringSubmatch(request)[2]
+	return path
+}
+
+func extractPostBody(request string) string {
+	body := regexp.MustCompile("\r\n\r\n(.*)").FindStringSubmatch(request)[1]
+	body = strings.Trim(body, "\x00")
+	return body
+}
+
+func writeResponse(conn net.Conn, response string) {
+	conn.Write([]byte(response))
 }
